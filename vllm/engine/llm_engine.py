@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import os
 import time
 from collections import Counter as collectionsCounter
 from collections import deque
@@ -43,6 +44,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.outputs import (PoolingRequestOutput, RequestOutput,
                           RequestOutputFactory)
+from vllm.plugins.kivo_kv.manager import KivoKVCacheManager
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.sequence import (ExecuteModelRequest, ParallelSampleSequenceGroup,
@@ -398,6 +400,7 @@ class LLMEngine:
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 
+
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
 
@@ -418,6 +421,8 @@ class LLMEngine:
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
+
+        self.kivo_kv = load_kv_plugin_if_any()
 
         self.model_executor.initialize_cache(num_gpu_blocks, num_cpu_blocks)
         elapsed = time.time() - start
@@ -1334,6 +1339,16 @@ class LLMEngine:
                 outputs = self.model_executor.execute_model(
                     execute_model_req=execute_model_req)
                 self._skip_scheduling_next_step = False
+
+                # --- KIVO DEBUG HOOK START ---
+                if hasattr(self, "kivo_kv") and self.kivo_kv:
+                    for seq_group in seq_group_metadata_list:
+                        session_id = seq_group.request_id  # unique identifier
+                        for seq in seq_group.seqs:
+                            step_id = seq.num_steps
+                            if seq.output_token is not None:
+                                self.kivo_kv.put(session_id, f"step{step_id}_token", str(seq.output_token))
+                # --- KIVO DEBUG HOOK END ---
             except InputProcessingError as e:
                 # The input for this request cannot be processed, so we must
                 # abort it. If there are remaining requests in the batch that
@@ -2059,3 +2074,12 @@ class LLMEngine:
 if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
     from vllm.v1.engine.llm_engine import LLMEngine as V1LLMEngine
     LLMEngine = V1LLMEngine  # type: ignore
+
+
+def load_kv_plugin_if_any() -> Optional[KivoKVCacheManager]:
+    if os.getenv("KV_PLUGIN", "").lower() == "kivo":
+        logger.info("[KIVO] Using KVCacheManager plugin.")
+        plugin = KivoKVCacheManager()
+        plugin.put("__init__", "test", "value")
+        return plugin
+    return None
