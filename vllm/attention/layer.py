@@ -24,6 +24,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
+from vllm.plugins.kivo_kv.env import kivo_enabled
+
 
 logger = init_logger(__name__)
 USE_XFORMERS_OPS = None

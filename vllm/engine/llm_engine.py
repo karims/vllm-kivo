@@ -42,6 +42,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.outputs import (PoolingRequestOutput, RequestOutput,
                           RequestOutputFactory)
+from vllm.plugins.kivo_kv import kivo_enabled
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.sequence import (ExecuteModelRequest, ParallelSampleSequenceGroup,
@@ -264,6 +265,21 @@ class LLMEngine:
         if self.model_config.runner_type != "pooling":
             self._initialize_kv_caches()
 
+        # --- inside LLMEngine.__init__ (or equivalent ctor) ---
+        self._kivo_enabled = kivo_enabled()
+        self._kivo_adapter = None
+        self._kivo_window = None
+        self._kivo_deadline_ns = None
+        if self._kivo_enabled:
+            # Late import to avoid overhead when disabled
+            from vllm.plugins.kivo_kv.adapters import NoopAdapter
+            from vllm.plugins.kivo_kv.env import get_window_tokens, get_deadline_ns
+            from vllm.plugins.kivo_kv.runtime import set_adapter
+
+            self._kivo_adapter = NoopAdapter()  # PR3/6 will replace with real backends
+            self._kivo_window = get_window_tokens()
+            self._kivo_deadline_ns = get_deadline_ns()
+            set_adapter(self._kivo_adapter)
         # If usage stat is enabled, collect relevant info.
         if is_usage_stats_enabled():
             from vllm.model_executor.model_loader import (
@@ -1330,6 +1346,49 @@ class LLMEngine:
                 execute_model_req.async_callback = self.async_callbacks[
                     virtual_engine]
 
+            # KIVO HOOK A: batch-level prefetch for DECODE groups
+            if getattr(self, "_kivo_enabled", False) and self._kivo_adapter is not None:
+                from time import monotonic_ns
+                from vllm.plugins.kivo_kv.plan_cache import plan_cache
+
+                # Only decode groups (prefill stays baseline in PR2)
+                decode_groups = scheduler_outputs.scheduled_seq_groups[
+                                scheduler_outputs.num_prefill_groups:
+                                ]
+
+                # Set “current step” context for attention-side lookup
+                # (you can also pass a monotonically increasing engine step counter)
+                # Here we use the max ‘t’ we compute below as a coarse step value.
+                max_t = 0
+                deadline = monotonic_ns() + int(self._kivo_deadline_ns or 0)
+
+                plan_cache.set_step(-1)  # provisional; we’ll set to max_t at the end
+
+                for sg in decode_groups:
+                    sgp = sg.seq_group
+                    req_id = sgp.request_id
+
+                    # Derive a per-request decode position t = prompt_len + generated_len
+                    prompt_len = len(getattr(sgp, "prompt_token_ids", []) or [])
+                    first_seq = sgp.get_seqs()[0]  # single-seq groups are the common case
+                    gen_len = int(first_seq.get_output_len())
+                    t = prompt_len + gen_len
+                    if t > max_t:
+                        max_t = t
+
+                    pages = self._kivo_adapter.plan(
+                        req_id=req_id,
+                        step=t,
+                        window_W=int(self._kivo_window or 4096),
+                    )
+                    # Non-blocking: fire-and-forget DMA
+                    self._kivo_adapter.prefetch(pages, deadline_ns=deadline)
+
+                    # Stash by layer for the ready/fallback gate in attention dispatch
+                    plan_cache.add_pages(pages)
+
+                plan_cache.set_step(max_t)
+            # End of KIVO HOOK A
             try:
                 outputs = self.model_executor.execute_model(
                     execute_model_req=execute_model_req)
@@ -2038,6 +2097,30 @@ class LLMEngine:
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args,
                                                   kwargs)
+
+    # --- helper (engine private) ---
+    def _kivo_batch_prefetch(self, active_req_ids: list[str], step_t: int) -> None:
+        if not self._kivo_enabled or self._kivo_adapter is None:
+            return
+        # Late import here to keep top-level clean
+        from time import monotonic_ns
+        from vllm.plugins.kivo_kv.plan_cache import plan_cache
+
+        plan_cache.set_step(step_t)
+
+        # NOTE: adapt this to however you access current step per req.
+        # Here we assume decode step = step_t for all active reqs in this microstep.
+        deadline = monotonic_ns() + (self._kivo_deadline_ns or 0)
+
+        for req_id in active_req_ids:
+            # Ask Kivo which pages will be needed for hot window W
+            pages = self._kivo_adapter.plan(req_id=req_id,
+                                            step=step_t,
+                                            window_W=int(self._kivo_window or 4096))
+            # Begin async transfers; non-blocking
+            self._kivo_adapter.prefetch(pages, deadline_ns=deadline)
+            # Stash planned pages keyed by layer for this step (engine → attention)
+            plan_cache.add_pages(pages)
 
 
 if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
